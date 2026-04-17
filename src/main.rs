@@ -2,6 +2,7 @@ mod evoformer;
 mod fetch;
 mod input;
 mod params;
+mod structure_module;
 
 use std::path::PathBuf;
 
@@ -75,6 +76,20 @@ fn main() -> Result<()> {
         evo.pair.shape()[1],
         evo.pair.shape()[2],
     );
+
+    // -------------------------------------------------------------------
+    // Structure Module
+    // -------------------------------------------------------------------
+    println!("Running Structure Module (8 fold iterations)…");
+    let struc = structure_module::run(&evo, &tensors)?;
+    println!(
+        "Structure Module done.  Final single rep: {}×{}\nPredicted Cα positions (Å):",
+        struc.single.shape()[0],
+        struc.single.shape()[1],
+    );
+    for (i, xyz) in struc.ca_coords.iter().enumerate() {
+        println!("  {:>3}  {:8.3}  {:8.3}  {:8.3}", i + 1, xyz[0], xyz[1], xyz[2]);
+    }
 
     Ok(())
 }

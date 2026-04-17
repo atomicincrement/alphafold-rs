@@ -128,7 +128,7 @@ prefix `alphafold/alphafold_iteration/`. The concrete dimensions are:
     `prev_pos_linear//weights [15, 128]` (15 Å-bins, one-hot encoded).
   - Add these to the embeddings at the start of each recycle pass.
 
-- [ ] **Structure Module** (`src/structure_module.rs`) — 8 shared-weight
+- [x] **Structure Module** (`src/structure_module.rs`) — 8 shared-weight
   iterations using `fold_iteration/…`:
   - Normalise inputs: `single_layer_norm` (γ/β [384]), `pair_layer_norm` (γ/β [128]).
   - Project single: `initial_projection//weights [384, 384]` (applied once before
