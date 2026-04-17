@@ -1,3 +1,4 @@
+mod evoformer;
 mod fetch;
 mod input;
 mod params;
@@ -57,6 +58,22 @@ fn main() -> Result<()> {
         p = inputs.pair.shape()[2],
         m = inputs.msa.shape()[2],
         e = inputs.extra_msa.shape()[2],
+    );
+
+    // -------------------------------------------------------------------
+    // Evoformer stack
+    // -------------------------------------------------------------------
+    println!("Running Evoformer (3 recycles × 48 blocks)…");
+    let evo = evoformer::run(&inputs, &tensors)?;
+    println!(
+        "Evoformer done.\n\
+         single : {}×{}\n\
+         pair   : {}×{}×{}",
+        evo.single.shape()[0],
+        evo.single.shape()[1],
+        evo.pair.shape()[0],
+        evo.pair.shape()[1],
+        evo.pair.shape()[2],
     );
 
     Ok(())
