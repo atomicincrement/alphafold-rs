@@ -68,7 +68,7 @@ prefix `alphafold/alphafold_iteration/`. The concrete dimensions are:
 
 | Representation | Dim | Source tensor |
 |---|---|---|
-| MSA / single (Evoformer) | 256 | `evoformer/preprocess_1d//weights [21, 256]` |
+| MSA (Multiple Sequence Alignment) / single (Evoformer) | 256 | `evoformer/preprocess_1d//weights [21, 256]` |
 | Pair | 128 | `evoformer/pair_activiations//weights [65, 128]` |
 | Extra-MSA | 64 | `evoformer/extra_msa_activations//weights [25, 64]` |
 | Single (Structure Module) | 384 | `evoformer/single_activations//weights [256, 384]` |
@@ -82,7 +82,8 @@ prefix `alphafold/alphafold_iteration/`. The concrete dimensions are:
 | Recycling bins (Cα dist) | 15 | `prev_pos_linear//weights [15, 128]` |
 
 - [x] **Input pipeline** (`src/input.rs`):
-  - Parse a single-sequence FASTA file. A "single-sequence mock MSA" means the
+  - Parse a single-sequence FASTA file. A "single-sequence mock MSA
+    (Multiple Sequence Alignment)" means the
     MSA has depth 1 and the extra-MSA is also a single-row mock.
   - Amino-acid alphabet: 21 tokens (20 standard + unknown/gap).
   - Embed the sequence:
@@ -96,7 +97,7 @@ prefix `alphafold/alphafold_iteration/`. The concrete dimensions are:
     - Add `pair_activiations//weights [65, 128]` (unit-position from `[L, L, 65]`
       features — set to zeros for single-sequence mode).
 
-- [ ] **Evoformer** (`src/evoformer.rs`) — run all 48 blocks using the stacked
+- [x] **Evoformer** (`src/evoformer.rs`) — run all 48 blocks using the stacked
   weights (slice `weights[b, ..]` for block `b`):
   - **MSA row attention with pair bias** — gated multi-head attention over
     residue axis; pair repr adds a learned bias via
@@ -120,7 +121,7 @@ prefix `alphafold/alphafold_iteration/`. The concrete dimensions are:
   - After 48 blocks project single repr: `single_activations//weights [256, 384]`
     → `[L, 384]` for the Structure Module.
 
-- [ ] **Recycling** (3 passes, reusing same weights):
+- [x] **Recycling** (3 passes, reusing same weights):
   - Normalise previous single/pair: `prev_msa_first_row_norm` (γ/β [256]),
     `prev_pair_norm` (γ/β [128]).
   - Encode previous Cα distances into pair repr via
