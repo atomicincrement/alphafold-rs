@@ -27,6 +27,48 @@ const EVO: &str =
 const XMSA: &str = "alphafold/alphafold_iteration/evoformer/extra_msa_stack/";
 
 // ── output ───────────────────────────────────────────────────────────────────
+
+/// The result of running the Evoformer neural network on a protein sequence.
+///
+/// # Fields
+///
+/// ## `single` — \[L, 384\]
+/// A table with one row per amino acid and 384 numbers per row. Think of it as
+/// a rich "character description" of each residue after the network has
+/// considered the full sequence context. Each row summarises what that residue
+/// "knows" about its neighbours, its chemical environment, and its likely role
+/// in the folded structure. This feeds directly into the structure module to
+/// predict backbone angles and positions.
+///
+/// Example: for HP36 (L=35), this is a 35×384 matrix. Row 0 describes leucine
+/// at position 1, row 1 describes serine at position 2, and so on.
+///
+/// ## `pair` — \[L, L, 128\]
+/// A square table — one cell for every pair of residues (i, j) — with 128
+/// numbers describing the *relationship* between residue i and residue j. It
+/// encodes things like "how likely are positions 5 and 22 to be in contact?"
+/// or "what distance/orientation is expected between these two?". This is what
+/// the triangle attention and triangle multiplication layers refine through all
+/// 48 blocks.
+///
+/// Example: for L=35 this is 35×35×128 ≈ 156,800 numbers. The cell at
+/// \[4, 21, :\] holds the 128-dimensional relationship vector between the 5th
+/// and 22nd residues.
+///
+/// ## `msa_first_row` — \[L, 256\]
+/// The final state of the MSA (Multiple Sequence Alignment) representation for
+/// the query sequence itself (depth-1 row), before it was projected to 384
+/// dims. Kept so it can be fed back into the recycling norms on the next
+/// recycle pass, or used as an intermediate by downstream modules. At 256 dims
+/// it is cheaper to store than `single` and retains the "pre-projection"
+/// signal.
+///
+/// # Big picture
+/// Imagine the network spending 48 rounds refining two whiteboards — one about
+/// individual residues (`single`/`msa_first_row`) and one about pairs of
+/// residues (`pair`). After 48 rounds (and 3 full recycles from scratch), these
+/// whiteboards contain enough geometric information for the structure module to
+/// translate them into 3-D atomic coordinates.
 #[allow(dead_code)]
 pub struct EvoformerOutput {
     pub single: Array2<f32>,       // [L, 384]
@@ -37,9 +79,16 @@ pub struct EvoformerOutput {
 
 // ── tensor helpers ────────────────────────────────────────────────────────────
 
-/// Fetch a slice of the stacked tensor at block index `b`.
-/// `w` has shape [num_blocks, ...]; returns view of [...].
-/// Get the 2-D weight matrix for block `b` from a stacked [blocks, in, out] tensor.
+/// Extract the weight matrix for a single block from a stacked “all-blocks” tensor.
+///
+/// The checkpoint stores every block’s weights together in one big array shaped
+/// `[num_blocks, in_dim, out_dim]`. This function picks out the slice for block
+/// `b`, giving back a plain 2-D matrix `[in_dim, out_dim]` ready for
+/// multiplication.
+///
+/// Example: the MSA-transition weights for block 5 live at
+/// `weights[5, :, :]` inside a `[48, 256, 1024]` tensor; `mat2(..., 5)`
+/// returns the `[256, 1024]` slice.
 fn mat2(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array2<f32>> {
     let t = params
         .get(key)
@@ -55,8 +104,15 @@ fn mat2(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array2<
         .into_dimensionality::<ndarray::Ix2>()?)
 }
 
-/// Get the 4-D weight [in, h, d] → as [in, h*d] for block `b`.
-/// Source shape [blocks, in_dim, heads, head_dim].
+/// Extract and flatten an attention weight tensor for block `b`.
+///
+/// Attention weights are stored per-block as `[blocks, in_dim, heads, head_dim]`.
+/// This pulls out block `b` and merges the head and head-dimension axes so the
+/// result is a plain `[in_dim, heads * head_dim]` matrix that can be used in a
+/// single matrix multiply to project all heads at once.
+///
+/// Example: query weights live in `[48, 256, 8, 32]`; `mat_attn(..., 3)`
+/// returns a `[256, 256]` matrix (8 heads × 32 dims each).
 fn mat_attn(
     params: &HashMap<String, Tensor>,
     key: &str,
@@ -75,7 +131,12 @@ fn mat_attn(
         .into_shape_with_order((in_dim, heads * head_dim))?)
 }
 
-/// [blocks, heads, head_dim] → [heads*head_dim]
+/// Extract and flatten the attention gating bias for block `b`.
+///
+/// Stored as `[blocks, heads, head_dim]`; returns a flat `[heads * head_dim]`
+/// vector that is broadcast-added to the gating logits.
+///
+/// Example: a `[48, 8, 32]` tensor → a length-256 vector for block `b`.
 fn bias_attn(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array1<f32>> {
     let t = params
         .get(key)
@@ -87,7 +148,14 @@ fn bias_attn(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Ar
     Ok(slice.into_shape_with_order(heads * head_dim)?)
 }
 
-/// [blocks, heads, head_dim, out] → [(heads*head_dim), out]
+/// Extract and flatten the attention output projection for block `b`.
+///
+/// Stored as `[blocks, heads, head_dim, out_dim]`; returns
+/// `[(heads * head_dim), out_dim]` so it can be applied with a single dot
+/// product after concatenating all head outputs into one long vector.
+///
+/// Example: MSA row-attention output weights `[48, 8, 32, 256]` →
+/// `[256, 256]` for block `b`.
 fn mat_attn_out(
     params: &HashMap<String, Tensor>,
     key: &str,
@@ -104,7 +172,12 @@ fn mat_attn_out(
     Ok(slice.into_shape_with_order((heads * head_dim, out_dim))?)
 }
 
-/// [blocks, dim] → [dim]
+/// Extract a 1-D bias or scale vector for block `b`.
+///
+/// Many tensors in the checkpoint are stacked as `[blocks, dim]`; this picks
+/// out the `[dim]` slice for block `b`.
+///
+/// Example: MSA-transition layer-norm scale `[48, 256]` → a length-256 vector.
 fn vec1(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array1<f32>> {
     let t = params
         .get(key)
@@ -112,7 +185,14 @@ fn vec1(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array1<
     Ok(t.data.slice(s![b, ..]).to_owned().into_dimensionality::<ndarray::Ix1>()?)
 }
 
-/// [blocks, h, d] → [h, d]  (for feat_2d_weights)
+/// Extract the pair-bias projection matrix for block `b`.
+///
+/// Used for `feat_2d_weights`, stored as `[blocks, pair_dim, heads]`; returns
+/// the `[pair_dim, heads]` slice for block `b`. This matrix converts each
+/// pair’s 128-dimensional description into a per-head scalar bias that
+/// nudges attention towards or away from that pair.
+///
+/// Example: `[48, 128, 8]` → `[128, 8]` for block `b`.
 fn mat_feat2d(
     params: &HashMap<String, Tensor>,
     key: &str,
@@ -126,16 +206,38 @@ fn mat_feat2d(
 
 // ── math primitives ──────────────────────────────────────────────────────────
 
+/// Squash any real number into the range (0, 1).
+///
+/// Used as a soft on/off switch for gating: values well below 0 approach 0
+/// (gate closed), values well above 0 approach 1 (gate fully open).
+/// `sigmoid(0) = 0.5`.
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Pass positive values through unchanged; clamp negatives to zero.
+///
+/// The non-linearity used between the two linear layers of every MLP
+/// (transition block). Without it, stacking linear layers would collapse to a
+/// single linear map and the network could not learn non-linear patterns.
 fn relu(x: f32) -> f32 {
     x.max(0.0)
 }
 
-/// Layer norm over the last axis.
-/// `x`: [*, C], `scale`: [C], `offset`: [C].
+/// Normalise each row of a 2-D array independently, then rescale.
+///
+/// For each row: subtract its mean, divide by its standard deviation
+/// (+ a tiny epsilon to avoid division by zero), multiply element-wise by
+/// `scale`, and add `offset`. The learned `scale` and `offset` let the
+/// network undo the normalisation if needed.
+///
+/// This keeps activations in a consistent numerical range across blocks,
+/// which stabilises training and inference. Applied before every attention
+/// and MLP sub-layer.
+///
+/// Example: a row `[10, 20, 30]` has mean 20 and std ≈ 8.16; after
+/// normalisation it becomes roughly `[-1.22, 0.0, 1.22]`, then scaled
+/// and shifted by the learned parameters.
 fn layer_norm_rows(x: &Array2<f32>, scale: &Array1<f32>, offset: &Array1<f32>) -> Array2<f32> {
     let eps = 1e-5_f32;
     let mut out = x.clone();
@@ -151,7 +253,12 @@ fn layer_norm_rows(x: &Array2<f32>, scale: &Array1<f32>, offset: &Array1<f32>) -
     out
 }
 
-/// Layer norm over last axis for a 3-D tensor [A, B, C].
+/// Normalise each “channel” slice of a 3-D tensor along the last axis.
+///
+/// Identical in meaning to `layer_norm_rows` but operates on a tensor shaped
+/// `[A, B, C]`, treating every `(i, j)` position as an independent row of
+/// length `C`. Used whenever pair representations (shape `[L, L, C]`) need
+/// normalising.
 fn layer_norm_3d(x: &Array3<f32>, scale: &Array1<f32>, offset: &Array1<f32>) -> Array3<f32> {
     let (a, b, c) = x.dim();
     let eps = 1e-5_f32;
@@ -171,7 +278,16 @@ fn layer_norm_3d(x: &Array3<f32>, scale: &Array1<f32>, offset: &Array1<f32>) -> 
     out
 }
 
-/// Linear: [M, K] @ [K, N] + [N] → [M, N].
+/// Apply a learned linear (fully-connected) layer to a 2-D input.
+///
+/// Multiplies every row of `x` by the weight matrix `w` and adds the bias
+/// vector. This is the fundamental building block of every MLP and projection
+/// in the network.
+///
+/// `x`: `[M, K]`, `w`: `[K, N]`, `bias`: `[N]` → output `[M, N]`.
+///
+/// Example: projecting 35 residues from 256 dims to 1024 dims:
+/// `x` is `[35, 256]`, `w` is `[256, 1024]`, result is `[35, 1024]`.
 fn linear(x: &Array2<f32>, w: &Array2<f32>, bias: &Array1<f32>) -> Array2<f32> {
     let mut y = x.dot(w);
     for mut row in y.rows_mut() {
@@ -180,7 +296,15 @@ fn linear(x: &Array2<f32>, w: &Array2<f32>, bias: &Array1<f32>) -> Array2<f32> {
     y
 }
 
-/// Same for 3-D input [A, B, K] → [A, B, N].
+/// Apply a learned linear layer to a 3-D input, treating the first two axes as a batch.
+///
+/// Internally reshapes `[A, B, K]` to `[A*B, K]`, calls the ordinary matrix
+/// multiply, then reshapes back to `[A, B, N]`. Used to apply the same
+/// projection to every `(i, j)` cell of the pair representation without
+/// writing explicit loops.
+///
+/// Example: projecting pair features `[35, 35, 128]` to `[35, 35, 512]`
+/// in the pair-transition MLP.
 fn linear3(x: &Array3<f32>, w: &Array2<f32>, bias: &Array1<f32>) -> Array3<f32> {
     let (a, b, k) = x.dim();
     let n = w.ncols();
@@ -196,12 +320,25 @@ fn linear3(x: &Array3<f32>, w: &Array2<f32>, bias: &Array1<f32>) -> Array3<f32> 
     y
 }
 
-// ── MSA row attention with pair bias ─────────────────────────────────────────
-//
-// For MSA depth S=1, msa has shape [S, L, C_m].
-// We attend over positions (j) for each sequence (i) independently.
-// Pair bias: pair [L, L, C_z] → bias per head [L, L, H_m].
-
+/// Let each residue gather information from all other residues along the sequence,
+/// guided by what the pair representation already knows about their relationship.
+///
+/// This is multi-head self-attention applied to a single row of the MSA (one
+/// sequence). The key addition over plain self-attention is a *pair bias*:
+/// before computing which positions attend to which, the pair table is projected
+/// to a per-head scalar and added to the attention logits, so the network can
+/// say “residues 3 and 17 are probably in contact — pay extra attention to that
+/// pair.”
+///
+/// Steps:
+/// 1. Layer-norm the MSA row and the pair table.
+/// 2. Project each position into query/key/value/gating vectors (one set per head).
+/// 3. Compute attention scores (`Q · Kᵀ / √D`), add pair bias, softmax.
+/// 4. Weighted sum of values; multiply by a sigmoid gate.
+/// 5. Project back to MSA dimension and add as a residual.
+///
+/// Result: updated MSA, same shape `[S, L, C_m]`, where each position now
+/// “knows” what its neighbours look like.
 fn msa_row_attention(
     msa: &Array3<f32>,   // [S, L, 256]
     pair: &Array3<f32>,  // [L, L, 128]
@@ -329,8 +466,16 @@ fn msa_row_attention(
     Ok(msa + &out)
 }
 
-// ── MSA transition (MLP) ──────────────────────────────────────────────────────
-
+/// Independently refine each position’s MSA description through a small two-layer network.
+///
+/// After attention has mixed information across positions, this MLP lets each
+/// residue’s representation “digest” what it received without looking at
+/// neighbours again. The hidden layer is 4× the input width (256 → 1024 → 256)
+/// with a ReLU in between.
+///
+/// Operates identically on every `(sequence, position)` cell in the MSA, so
+/// it is equivalent to running the same small network on each of the `S × L`
+/// rows independently. The result is added back as a residual.
 fn msa_transition(
     msa: &Array3<f32>,
     params: &HashMap<String, Tensor>,
@@ -353,11 +498,25 @@ fn msa_transition(
     Ok(msa + &out)
 }
 
-// ── Outer-product mean → pair update ─────────────────────────────────────────
-//
-// For depth-1 MSA: outer product of the single row with itself.
-// Result: [L, L, 128].
-
+/// Bridge the MSA and pair representations: turn per-residue information into
+/// pairwise information.
+///
+/// For every pair of positions `(i, j)`, compute the outer product of their
+/// compressed MSA descriptions, then project the result into the pair
+/// dimension. The “mean” in the name refers to averaging over MSA depth
+/// (here depth=1, so no averaging needed).
+///
+/// Concretely:
+/// 1. Layer-norm the MSA first row → `[L, 256]`.
+/// 2. Project each position to 32 dims via separate left/right projections.
+/// 3. For each pair `(i, j)`: form the 32×32 = 1024-element outer product
+///    `left[i] ⊗ right[j]`, then project to 128 dims.
+///
+/// Example: if residue 5 “looks like a helix-former” and residue 22 “looks
+/// like a beta-sheet-former”, the outer product encodes that combination and
+/// the projection learns what it means for the pair (5, 22).
+///
+/// Returns the *update* `[L, L, 128]` which is added to the pair table.
 fn outer_product_mean(
     msa: &Array3<f32>,   // [1, L, 256]
     params: &HashMap<String, Tensor>,
@@ -409,8 +568,24 @@ fn outer_product_mean(
     Ok(out)
 }
 
-// ── Triangle multiplication ───────────────────────────────────────────────────
-
+/// Update each pair `(i, j)` by combining information from all “intermediary”
+/// residues `k` that connect them.
+///
+/// The key insight is geometric: if we know the relationship between i and k,
+/// and between j and k, we can infer something about i and j (like the third
+/// side of a triangle). There are two variants:
+///
+/// - **Outgoing** (`outgoing = true`): `result[i,j] = Σ_k  left[i,k] ⊙ right[j,k]`
+///   — “everything k is ‘downstream’ of i AND ‘downstream’ of j”.
+/// - **Incoming** (`outgoing = false`): `result[i,j] = Σ_k  left[k,j] ⊙ right[k,i]`
+///   — “everything k is ‘upstream’ of both i and j”.
+///
+/// Both projections are gated (element-wise sigmoid) before the summation,
+/// and the result is gated again before being added as a residual to the pair
+/// table.
+///
+/// Example (outgoing): to update the relationship between residues 3 and 14,
+/// sum over all residues k the (gated) product of `pair[3,k]` and `pair[14,k]`.
 fn triangle_multiplication(
     pair: &Array3<f32>,  // [L, L, 128]
     params: &HashMap<String, Tensor>,
@@ -504,13 +679,24 @@ fn triangle_multiplication(
     Ok(pair + &gated)
 }
 
-// ── Triangle attention ────────────────────────────────────────────────────────
-//
-// starting_node: for each i, attend over j using pair[i,j,:] as seq,
-//   with pair bias from pair[i,:,:] projected.
-// ending_node:   for each j, attend over i using pair[i,j,:],
-//   with pair bias from pair[:,j,:] projected.
-
+/// Update the pair table by running attention *within* each row or column of
+/// the pair matrix, biased by the pair values themselves.
+///
+/// Two variants:
+/// - **Starting node** (`starting = true`): for each residue `i`, attend
+///   across all `j` within the row `pair[i, :, :]`. Residue `i` asks:
+///   “which other residues j should I update my relationship with, based on
+///   how all my pair relationships look?”
+/// - **Ending node** (`starting = false`): for each residue `j`, attend
+///   across all `i` within the column `pair[:, j, :]`. Symmetric complement.
+///
+/// The “triangle” bias: the pair values for the query row/column are projected
+/// to per-head scalars and added to the attention logits, so the network can
+/// focus attention on pairs that already have strong signals.
+///
+/// Example (starting): when updating `pair[3, 14]`, residue 3 attends over
+/// all its rows (`pair[3, 0]`, `pair[3, 1]`, …) and aggregates what it
+/// learns, biased by the pair values in that row.
 fn triangle_attention(
     pair: &Array3<f32>,
     params: &HashMap<String, Tensor>,
@@ -626,8 +812,12 @@ fn triangle_attention(
     Ok(pair + &out)
 }
 
-// ── Pair transition (MLP) ─────────────────────────────────────────────────────
-
+/// Independently refine each pair’s description through a small two-layer network.
+///
+/// The pair-table analogue of `msa_transition`: after the triangle operations
+/// have mixed information across the pair table, this MLP lets each cell
+/// `(i, j)` process its new state without looking at neighbours. Hidden layer
+/// is 4× wider (128 → 512 → 128) with ReLU. Result added as a residual.
 fn pair_transition(
     pair: &Array3<f32>,
     params: &HashMap<String, Tensor>,
@@ -650,8 +840,23 @@ fn pair_transition(
     Ok(pair + &out)
 }
 
-// ── Single Evoformer block ────────────────────────────────────────────────────
-
+/// Run one complete Evoformer block, updating both the MSA and pair representations.
+///
+/// Each block applies these sub-layers in order:
+/// 1. **MSA row attention with pair bias** — residues exchange information
+///    along the sequence direction, guided by the current pair table.
+/// 2. **MSA transition** — each position digests what it received (MLP).
+/// 3. **Outer-product mean** — per-residue MSA info is folded into the pair table.
+/// 4. **Triangle multiplication outgoing** — pair table updated via shared intermediaries.
+/// 5. **Triangle multiplication incoming** — symmetric complement.
+/// 6. **Triangle attention starting** — row-wise attention within the pair table.
+/// 7. **Triangle attention ending** — column-wise attention within the pair table.
+/// 8. **Pair transition** — each pair cell digests its update (MLP).
+///
+/// Every sub-layer is a residual: its output is *added* to the input, so the
+/// block can only refine, never erase, what it received.
+///
+/// Returns `(updated_msa, updated_pair)`, same shapes as inputs.
 fn evoformer_block(
     msa: &Array3<f32>,   // [1, L, 256]
     pair: &Array3<f32>,  // [L, L, 128]
@@ -718,10 +923,19 @@ fn evoformer_block(
     Ok((msa, pair))
 }
 
-// ── Extra-MSA stack (4 blocks, dim=64) ───────────────────────────────────────
-// Runs on the extra_msa [1, L, 64] representation and updates pair.
-// Structure is identical to evoformer with different weight prefixes and dims.
-
+/// Run one block of the extra-MSA stack, which pre-conditions the pair table
+/// before the main 48-block Evoformer stack.
+///
+/// The extra-MSA representation is a compact 64-dimensional summary of the
+/// sequence (compared to the full 256-dim MSA). Four such blocks run first,
+/// allowing the pair table to absorb low-cost sequence-level signals before
+/// the expensive main stack begins.
+///
+/// The architecture is identical to `evoformer_block` but uses different
+/// checkpoint weights (`extra_msa_stack/` prefix) and a narrower residue
+/// dimension (64 instead of 256).
+///
+/// Returns `(updated_extra_msa, updated_pair)`.
 fn extra_msa_block(
     extra: &Array3<f32>,  // [1, L, 64]
     pair: &Array3<f32>,   // [L, L, 128]
@@ -775,10 +989,21 @@ fn extra_msa_block(
     Ok((extra, pair))
 }
 
-// ── Recycling helper ──────────────────────────────────────────────────────────
-// Apply layer-norms to prev_msa_first_row and prev_pair, then add to the
-// current pair representation before the main stack.
-
+/// Inject the previous recycle’s output into the current recycle’s starting state.
+///
+/// AlphaFold2 runs the full Evoformer stack multiple times (“recycles”). After
+/// each pass, the final MSA first row and pair table are saved. At the *start*
+/// of the next pass they are layer-normed and added to the freshly embedded
+/// inputs, giving the network a memory of what it predicted last time.
+///
+/// - `prev_msa_row` (from the last recycle) is normed and added to the
+///   first row of the current MSA embedding.
+/// - `prev_pair` (from the last recycle) is normed and added to the
+///   current pair embedding.
+///
+/// On the very first recycle both are zero, so this is a no-op and the
+/// network starts from scratch. By recycle 3 the representations are already
+/// close to converged and the stack only makes small corrections.
 fn apply_recycling(
     msa: &Array3<f32>,    // [1, L, 256] — current init
     pair: &Array3<f32>,   // [L, L, 128] — current init
@@ -840,8 +1065,25 @@ fn apply_recycling(
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
-/// Run the full Evoformer stack (3 recycles × 48 blocks) and return
-/// single [L,384] and pair [L,L,128] representations.
+/// Run the full Evoformer pipeline and return per-residue and pairwise representations.
+///
+/// This is the top-level function that orchestrates everything:
+///
+/// 1. **4 extra-MSA blocks** — warm up the pair table cheaply.
+/// 2. **48 main Evoformer blocks** — deeply refine both MSA and pair.
+/// 3. **3 recycles** — repeat steps 1–2 three more times, each time
+///    seeding the starting state with the previous pass’s output.
+/// 4. **Final projection** — project the MSA first row from 256 → 384 dims
+///    (with ReLU) to produce the `single` representation consumed by the
+///    structure module.
+///
+/// Progress is printed to stderr (`recycle N/3`, `extra-msa block b`,
+/// `evoformer block b`) so you can see it working even for small sequences.
+///
+/// Returns an [`EvoformerOutput`] containing:
+/// - `single`        — `[L, 384]` per-residue features for the structure module.
+/// - `pair`          — `[L, L, 128]` pairwise features for the structure module.
+/// - `msa_first_row` — `[L, 256]` pre-projection MSA row, retained for inspection.
 pub fn run(inputs: &Inputs, params: &HashMap<String, Tensor>) -> Result<EvoformerOutput> {
     let l = inputs.len;
 
