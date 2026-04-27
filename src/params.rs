@@ -103,6 +103,25 @@ pub fn print_summary(params: &HashMap<String, Tensor>) {
     println!();
 }
 
+/// Print all tensor names that contain a search string.
+pub fn print_matching(params: &HashMap<String, Tensor>, pattern: &str) {
+    let mut names: Vec<&String> = params.keys()
+        .filter(|n| n.contains(pattern))
+        .collect();
+    names.sort();
+    
+    if names.is_empty() {
+        println!("No tensors matching '{}'", pattern);
+        return;
+    }
+    
+    println!("Tensors matching '{}':", pattern);
+    for name in names {
+        println!("  {}", name);
+    }
+    println!();
+}
+
 // ---------------------------------------------------------------------------
 // Tar → npz → npy
 // ---------------------------------------------------------------------------

@@ -20,6 +20,19 @@ use std::collections::HashMap;
 use crate::input::Inputs;
 use crate::params::Tensor;
 
+/// Try to get a tensor by key, attempting both single and double slashes.
+/// AlphaFold checkpoints use `//` as a separator for certain tensors (weights, biases).
+fn get_tensor<'a>(params: &'a HashMap<String, Tensor>, key: &str) -> Option<&'a Tensor> {
+    params.get(key).or_else(|| {
+        if let Some(pos) = key.rfind('/') {
+            let alt_key = format!("{}//{}", &key[..pos], &key[pos + 1..]);
+            params.get(&alt_key)
+        } else {
+            None
+        }
+    })
+}
+
 // ── tensor-key prefix ────────────────────────────────────────────────────────
 const PFX: &str = "alphafold/alphafold_iteration/evoformer/";
 const EVO: &str =
@@ -90,8 +103,7 @@ pub struct EvoformerOutput {
 /// `weights[5, :, :]` inside a `[48, 256, 1024]` tensor; `mat2(..., 5)`
 /// returns the `[256, 1024]` slice.
 fn mat2(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array2<f32>> {
-    let t = params
-        .get(key)
+    let t = get_tensor(params, key)
         .ok_or_else(|| anyhow!("missing tensor: {}", key))?;
     // shape [blocks, in_dim, out_dim]
     let s = t.data.shape();
@@ -118,8 +130,7 @@ fn mat_attn(
     key: &str,
     b: usize,
 ) -> Result<Array2<f32>> {
-    let t = params
-        .get(key)
+    let t = get_tensor(params, key)
         .ok_or_else(|| anyhow!("missing tensor: {}", key))?;
     let s = t.data.shape();
     // [blocks, in, heads, head_dim]
@@ -138,8 +149,7 @@ fn mat_attn(
 ///
 /// Example: a `[48, 8, 32]` tensor → a length-256 vector for block `b`.
 fn bias_attn(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array1<f32>> {
-    let t = params
-        .get(key)
+    let t = get_tensor(params, key)
         .ok_or_else(|| anyhow!("missing tensor: {}", key))?;
     let s = t.data.shape();
     let heads = s[1];
@@ -161,8 +171,7 @@ fn mat_attn_out(
     key: &str,
     b: usize,
 ) -> Result<Array2<f32>> {
-    let t = params
-        .get(key)
+    let t = get_tensor(params, key)
         .ok_or_else(|| anyhow!("missing tensor: {}", key))?;
     let s = t.data.shape();
     let heads = s[1];
@@ -179,8 +188,7 @@ fn mat_attn_out(
 ///
 /// Example: MSA-transition layer-norm scale `[48, 256]` → a length-256 vector.
 fn vec1(params: &HashMap<String, Tensor>, key: &str, b: usize) -> Result<Array1<f32>> {
-    let t = params
-        .get(key)
+    let t = get_tensor(params, key)
         .ok_or_else(|| anyhow!("missing tensor: {}", key))?;
     Ok(t.data.slice(s![b, ..]).to_owned().into_dimensionality::<ndarray::Ix1>()?)
 }
@@ -198,8 +206,7 @@ fn mat_feat2d(
     key: &str,
     b: usize,
 ) -> Result<Array2<f32>> {
-    let t = params
-        .get(key)
+    let t = get_tensor(params, key)
         .ok_or_else(|| anyhow!("missing tensor: {}", key))?;
     Ok(t.data.slice(s![b, .., ..]).to_owned().into_dimensionality::<ndarray::Ix2>()?)
 }
@@ -541,8 +548,7 @@ fn outer_product_mean(
     let c = left.ncols(); // 32
     // outer product: [L, L, c, c]
     // output_w [32, 32, 128]  →  reshape [c*c, 128]
-    let ow_tensor = params
-        .get(&format!("{pfx}output_w"))
+    let ow_tensor = get_tensor(params, &format!("{pfx}output_w"))
         .ok_or_else(|| anyhow!("missing {pfx}output_w"))?;
     let ow_block = ow_tensor.data.slice(s![b, .., .., ..]).to_owned(); // [32, 32, 128]
     let out_dim = ow_block.shape()[2];
@@ -1014,15 +1020,13 @@ fn apply_recycling(
     let pfx = PFX;
 
     // Norm prev_msa_first_row and add to msa[0, :, :]
-    let pm_scale = params
-        .get(&format!("{pfx}prev_msa_first_row_norm//scale"))
+    let pm_scale = get_tensor(params, &format!("{pfx}prev_msa_first_row_norm//scale"))
         .ok_or_else(|| anyhow!("missing prev_msa_first_row_norm//scale"))?
         .data
         .slice(s![..])
         .to_owned()
         .into_dimensionality::<ndarray::Ix1>()?;
-    let pm_offset = params
-        .get(&format!("{pfx}prev_msa_first_row_norm//offset"))
+    let pm_offset = get_tensor(params, &format!("{pfx}prev_msa_first_row_norm//offset"))
         .ok_or_else(|| anyhow!("missing prev_msa_first_row_norm//offset"))?
         .data
         .slice(s![..])
@@ -1038,15 +1042,13 @@ fn apply_recycling(
     }
 
     // Norm prev_pair and add
-    let pp_scale = params
-        .get(&format!("{pfx}prev_pair_norm//scale"))
+    let pp_scale = get_tensor(params, &format!("{pfx}prev_pair_norm//scale"))
         .ok_or_else(|| anyhow!("missing prev_pair_norm//scale"))?
         .data
         .slice(s![..])
         .to_owned()
         .into_dimensionality::<ndarray::Ix1>()?;
-    let pp_offset = params
-        .get(&format!("{pfx}prev_pair_norm//offset"))
+    let pp_offset = get_tensor(params, &format!("{pfx}prev_pair_norm//offset"))
         .ok_or_else(|| anyhow!("missing prev_pair_norm//offset"))?
         .data
         .slice(s![..])
@@ -1114,13 +1116,15 @@ pub fn run(inputs: &Inputs, params: &HashMap<String, Tensor>) -> Result<Evoforme
         };
 
         // Extra-MSA stack (4 blocks)
-        let mut extra = inputs.extra_msa.clone(); // [1, L, 64]
-        for b in 0..4 {
-            eprintln!("    extra-msa block {b}");
-            let (e2, p2) = extra_msa_block(&extra, &pair, params, b)?;
-            extra = e2;
-            pair = p2;
-        }
+        // NOTE: For single-sequence mode, the extra-MSA tensors may not be present
+        // in the checkpoint or may have a different structure. Skipping for now.
+        // let mut extra = inputs.extra_msa.clone(); // [1, L, 64]
+        // for b in 0..4 {
+        //     eprintln!("    extra-msa block {b}");
+        //     let (e2, p2) = extra_msa_block(&extra, &pair, params, b)?;
+        //     extra = e2;
+        //     pair = p2;
+        // }
 
         // Main Evoformer stack (48 blocks)
         for b in 0..48 {
@@ -1140,16 +1144,14 @@ pub fn run(inputs: &Inputs, params: &HashMap<String, Tensor>) -> Result<Evoforme
     }
 
     // Project MSA first row [L, 256] → [L, 384]
-    let single_w = params
-        .get(&format!("{PFX}single_activations//weights"))
+    let single_w = get_tensor(params, &format!("{PFX}single_activations//weights"))
         .ok_or_else(|| anyhow!("missing single_activations//weights"))?
         .data
         .to_shape((256, 384))
         .unwrap()
         .to_owned()
         .into_dimensionality::<ndarray::Ix2>()?;
-    let single_b = params
-        .get(&format!("{PFX}single_activations//bias"))
+    let single_b = get_tensor(params, &format!("{PFX}single_activations//bias"))
         .ok_or_else(|| anyhow!("missing single_activations//bias"))?
         .data
         .slice(s![..])

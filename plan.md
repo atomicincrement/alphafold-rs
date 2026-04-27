@@ -165,7 +165,7 @@ prefix `alphafold/alphafold_iteration/`. The concrete dimensions are:
   - Download the PDB, extract experimental Cα coordinates.
   - After inference compute RMSD with Kabsch optimal superposition (pure ndarray,
     SVD via power-iteration or a simple 3×3 closed-form solver).
-  - Target: RMSD < 3 Å is a meaningful result for a 36-residue helix bundle.
+  - Target: RMSD < 3 Å is a meaningful result for a 36-residue helix bundle.s
   - Print: `RMSD = X.XX Å  mean-pLDDT = YY.Y`.
 
 
@@ -173,17 +173,16 @@ prefix `alphafold/alphafold_iteration/`. The concrete dimensions are:
 
 ### 4. 3D visualiser using Bevy
 
-- [ ] Add `bevy` (default features or a minimal subset: `render`, `pbr`,
-      `winit`) to `Cargo.toml` behind a feature flag `--features visualise` so
+- [x] Add `bevy` (version 0.13, optional) to `Cargo.toml` behind a feature flag `--features visualise` so
       the core inference binary stays lightweight.
-- [ ] Write a `visualise` module (`src/visualise.rs`) that:
-  - Spawns a Bevy app with an orbit camera (mouse drag to rotate, scroll to
-    zoom).
-  - Renders each Cα atom as a small sphere mesh.
-  - Connects adjacent Cα atoms with cylinder "bond" meshes to form the backbone
-    chain.
-  - Colours residues by a rainbow gradient (N-terminus blue → C-terminus red).
-- [ ] Overlay the experimental structure (loaded from the PDB file) as a
+- [x] Write a `visualise` module (`src/visualise.rs`) that:
+  - [x] Spawns a Bevy app with an orbit camera (mouse drag to rotate, scroll to
+      zoom).
+  - [x] Renders each Cα atom as a small sphere mesh.
+  - [x] Connects adjacent Cα atoms with cylinder "bond" meshes to form the backbone
+      chain.
+  - [x] Colours residues by a rainbow gradient (N-terminus blue → C-terminus red).
+- [x] Overlay the experimental structure (loaded from the PDB file) as a
       semi-transparent grey chain for visual comparison.
 - [ ] Add a simple UI panel (using `bevy_egui` or Bevy's built-in text) showing
       the sequence, RMSD, and per-residue confidence (pLDDT proxy).
