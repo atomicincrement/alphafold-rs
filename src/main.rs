@@ -32,6 +32,10 @@ enum Commands {
 
         /// Output JSON file for coordinates
         output: PathBuf,
+
+        /// Optional: Save Evoformer intermediate outputs (pair and single representations)
+        #[arg(long, value_name = "FILE")]
+        save_evoformer: Option<PathBuf>,
     },
 
     /// Visualize one or more coordinate files
@@ -45,8 +49,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Commands::Generate { fasta, output } => {
-            cmd_generate(&fasta, &output, args.model_path)?;
+        Commands::Generate { fasta, output, save_evoformer } => {
+            cmd_generate(&fasta, &output, save_evoformer, args.model_path)?;
         }
         Commands::Visualise { coords } => {
             cmd_visualise(&coords)?;
@@ -57,7 +61,12 @@ fn main() -> Result<()> {
 }
 
 /// Generate predicted Cα coordinates from FASTA and save to JSON
-fn cmd_generate(fasta_path: &PathBuf, output_path: &PathBuf, model_path: Option<PathBuf>) -> Result<()> {
+fn cmd_generate(
+    fasta_path: &PathBuf,
+    output_path: &PathBuf,
+    save_evoformer: Option<PathBuf>,
+    model_path: Option<PathBuf>,
+) -> Result<()> {
     println!("Reading FASTA from: {}", fasta_path.display());
     let fasta_text = std::fs::read_to_string(fasta_path)?;
 
@@ -112,6 +121,67 @@ fn cmd_generate(fasta_path: &PathBuf, output_path: &PathBuf, model_path: Option<
         evo.pair.shape()[1],
         evo.pair.shape()[2],
     );
+
+    // Save Evoformer intermediate outputs if requested
+    if let Some(evo_path) = save_evoformer {
+        println!("\nSaving Evoformer intermediates to: {}", evo_path.display());
+        
+        // Create intermediate data structure
+        #[derive(serde::Serialize)]
+        struct EvoformerIntermediate {
+            single_shape: Vec<usize>,
+            single_stats: SingleStats,
+            pair_shape: Vec<usize>,
+            pair_stats: PairStats,
+        }
+        
+        #[derive(serde::Serialize)]
+        struct SingleStats {
+            mean: f32,
+            std: f32,
+            min: f32,
+            max: f32,
+        }
+        
+        #[derive(serde::Serialize)]
+        struct PairStats {
+            mean: f32,
+            std: f32,
+            min: f32,
+            max: f32,
+        }
+        
+        let single_mean = evo.single.mean().unwrap_or(0.0);
+        let single_std = evo.single.std(0.0);
+        let single_min = evo.single.iter().copied().fold(f32::INFINITY, f32::min);
+        let single_max = evo.single.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        
+        let pair_mean = evo.pair.mean().unwrap_or(0.0);
+        let pair_std = evo.pair.std(0.0);
+        let pair_min = evo.pair.iter().copied().fold(f32::INFINITY, f32::min);
+        let pair_max = evo.pair.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        
+        let intermediate = EvoformerIntermediate {
+            single_shape: vec![evo.single.shape()[0], evo.single.shape()[1]],
+            single_stats: SingleStats {
+                mean: single_mean as f32,
+                std: single_std as f32,
+                min: single_min,
+                max: single_max,
+            },
+            pair_shape: vec![evo.pair.shape()[0], evo.pair.shape()[1], evo.pair.shape()[2]],
+            pair_stats: PairStats {
+                mean: pair_mean as f32,
+                std: pair_std as f32,
+                min: pair_min,
+                max: pair_max,
+            },
+        };
+        
+        let json = serde_json::to_string_pretty(&intermediate)?;
+        std::fs::write(&evo_path, json)?;
+        println!("Saved Evoformer statistics to: {}", evo_path.display());
+    }
 
     // -------------------------------------------------------------------
     // Structure Module
