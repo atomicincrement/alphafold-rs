@@ -199,6 +199,15 @@ fn update_frames(frames: &mut Vec<Frame>, delta: &Array2<f32>) {
         let q = [1. / norm, b / norm, c / norm, d / norm];
         let r = quat_to_rot(q);
         let delta_frame = Frame { r, t: [x, y, z] };
+        
+        // DEBUG: Log quaternion details
+        if std::env::var("DEBUG_STRUCT_VERBOSE").is_ok() && i == 0 {
+            let q_mag = (q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]).sqrt();
+            eprintln!("[update_frames] q={:.4},{:.4},{:.4},{:.4} mag={:.6} [b,c,d]=[{:.4},{:.4},{:.4}]",
+                q[0], q[1], q[2], q[3], q_mag, b, c, d);
+            eprintln!("[update_frames] delta_t=[{:.4},{:.4},{:.4}]", x, y, z);
+        }
+        
         frames[i] = frames[i].compose(&delta_frame);
     }
 }
@@ -600,7 +609,7 @@ pub fn run(
     let mut frames: Vec<Frame> = (0..l).map(|_| Frame::identity()).collect();
 
     // ── 8 fold iterations ─────────────────────────────────────────────────
-    for _iter in 0..NUM_ITER {
+    for iter in 0..NUM_ITER {
         // 1. Layer-norm single before IPA
         let s_normed = layer_norm(&single, &attn_ln_s, &attn_ln_o);
 
@@ -622,6 +631,31 @@ pub fn run(
 
         // 6. Backbone update: produce [L, 6] delta, update frames
         let delta = linear(&single, &waf, &baf); // [L, 6]
+        
+        // DEBUG: Log delta statistics
+        if std::env::var("DEBUG_STRUCT").is_ok() {
+            let delta_t: Vec<f32> = (0..l)
+                .map(|i| (delta[[i, 3]] * delta[[i, 3]] + delta[[i, 4]] * delta[[i, 4]] + delta[[i, 5]] * delta[[i, 5]]).sqrt())
+                .collect();
+            let t_mean = delta_t.iter().sum::<f32>() / l as f32;
+            let t_max = delta_t.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("[iter {}] delta_t: mean={:.4}, max={:.4}", iter, t_mean, t_max);
+            
+            let delta_q: Vec<f32> = (0..l)
+                .map(|i| (1.0_f32 + delta[[i, 0]] * delta[[i, 0]] + delta[[i, 1]] * delta[[i, 1]] + delta[[i, 2]] * delta[[i, 2]]).sqrt())
+                .collect();
+            let q_mean = delta_q.iter().sum::<f32>() / l as f32;
+            eprintln!("[iter {}] delta_q_norm: mean={:.4}", iter, q_mean);
+            
+            // Frame translation magnitudes
+            let frame_t: Vec<f32> = frames.iter()
+                .map(|f| (f.t[0] * f.t[0] + f.t[1] * f.t[1] + f.t[2] * f.t[2]).sqrt())
+                .collect();
+            let t_frame_mean = frame_t.iter().sum::<f32>() / l as f32;
+            let t_frame_max = frame_t.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("[iter {}] frame_t: mean={:.4}, max={:.4}", iter, t_frame_mean, t_frame_max);
+        }
+        
         update_frames(&mut frames, &delta);
     }
 
@@ -633,6 +667,26 @@ pub fn run(
     let ca_coords: Vec<[f32; 3]> = frames.iter().map(|f| {
         [f.t[0] * scale, f.t[1] * scale, f.t[2] * scale]
     }).collect();
+
+    // DEBUG: Log final inter-residue distances
+    if std::env::var("DEBUG_STRUCT").is_ok() {
+        eprintln!("\n[FINAL] Inter-residue Ca-Ca distances (scaled):");
+        let mut total_dist = 0.0_f32;
+        for i in 0..ca_coords.len() - 1 {
+            let c1 = ca_coords[i];
+            let c2 = ca_coords[i + 1];
+            let dx = c2[0] - c1[0];
+            let dy = c2[1] - c1[1];
+            let dz = c2[2] - c1[2];
+            let dist = (dx*dx + dy*dy + dz*dz).sqrt();
+            total_dist += dist;
+            if i < 5 {
+                eprintln!("  {} → {}: {:.3} Å", i + 1, i + 2, dist);
+            }
+        }
+        let mean_dist = total_dist / (ca_coords.len() - 1) as f32;
+        eprintln!("  Mean distance: {:.3} Å", mean_dist);
+    }
 
     Ok(StructureOutput { ca_coords, single })
 }
